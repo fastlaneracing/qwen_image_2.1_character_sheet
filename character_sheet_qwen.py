@@ -1,0 +1,867 @@
+"""Muse Character Sheet (Qwen Image 2.1).
+
+[2026-09-30] Port of MuseCharacterSheetKlein (muse-character-sheet-klein)
+to Qwen Image 2.1. Everything model-agnostic - session state, confirm /
+re-roll / edit / reset actions, face detail, RMBG, sheet assembly, the JS
+panel - is carried over unchanged. Only the backend differs:
+
+  Klein                                   Qwen Image 2.1
+  UNET/CLIP(flux2)/VAE + FluxKVCache      UNET/CLIP(qwen_image)/VAE + optional QwenImage21Cache
+  CLIPTextEncode + ReferenceLatent        TextEncodeQwenImage21 (the Qwen3-VL encoder SEES the
+    + ConditioningZeroOut negative          references, and they're spliced in as VAE latents)
+  no negative prompt, cfg 1, 4 steps      real negative prompt, cfg 4, 40 steps
+  EmptyFlux2LatentImage (128 ch)          zero 64-ch latent at /16 (latent_formats.QwenImage21)
+
+Poses are still described in text (POSE_PROMPTS) and anchored to the one
+character_image reference; an optional pose_reference_image mannequin
+sheet is cropped per pose and passed as image 2.
+
+Architecture note (same hard platform constraint as the Krea2 node): Python
+can only act from inside a real node execution triggered by a /prompt
+submission - every user action (initial run, re-roll one pose, finalize) is
+its own small /prompt submission from the JS side; state that must survive
+between those submissions rides in the hidden `state_json` widget plus an
+in-process cache here keyed by the node's unique_id.
+"""
+import hashlib
+import json
+import random
+
+import torch
+
+import comfy.model_management
+import comfy.samplers
+import comfy.utils
+import folder_paths
+import nodes as comfy_nodes
+from comfy_execution.graph import ExecutionBlocker
+
+POSE_NAMES = ["01_portrait", "02_front", "03_left_profile", "04_right_profile", "05_back"]
+POSE_LABELS = ["Portrait (close-up)", "Front", "Left profile", "Right profile", "Back"]
+DEFAULT_SEEDS = [41001, 41002, 41003, 41004, 41005]
+
+# [2026-09-19] Target (latent-space) pixel resolution per pose - independent of
+# whatever aspect ratio the character reference photo happens to be, so the
+# final sheet's panels stay consistent regardless of the source image. Same
+# proportions as the Krea2 node's own TARGET_SIZE, but rounded to multiples of
+# 16 (FLUX.2's own resolution requirement - see BFL's prompting guide: "Output
+# dimensions must be multiples of 16").
+# [2026-09-22] Left/right profile narrowed from 544 to 416 (still a multiple
+# of 16) - a true side-on silhouette is only chest-to-back deep, much
+# narrower than a front-on shoulder-to-shoulder view, so sharing the front
+# pose's canvas width was making the model widen/stockify the body to fill
+# the frame (Andy: "they don't look like they represent the normal height of
+# the person"). Height is unchanged, so ALIGN_BODY_KW's fixed figure_height/
+# bottom_margin still line every panel up at the same final height in
+# _assemble_final - only the pre-alignment generation canvas is narrower.
+# [2026-09-30] Qwen port: same sizes, but Qwen Image 2.1 wants multiples of
+# 32 - only the portrait's 976 height wasn't, now 960. References are sized
+# independently by TextEncodeQwenImage21 (ref_resolution), so they don't
+# need to match these.
+TARGET_SIZE = {
+    "01_portrait": (544, 960),
+    "02_front": (544, 1792),
+    "03_left_profile": (416, 1792),
+    "04_right_profile": (416, 1792),
+    "05_back": (544, 1792),
+}
+
+ALIGN_BODY_KW = dict(width=704, height=2304, figure_height=2048, bottom_margin=128, threshold=0.1)
+PORTRAIT_FINAL_SIZE = (1280, 2304)  # (width, height)
+
+# [2026-09-17] pose_reference_image crop rects - identical to the Krea2
+# sibling node's own GUIDE_CROPS (same mannequin template layout, verified
+# against Codex's original manual "KREA 2 Character Sheet - Pose Guides"
+# workflow, byte-identical numbers). Added because the previous approach -
+# feeding the WHOLE 5-panel sheet as one reference, unchanged, for all 5
+# generations - relied entirely on the model's own vision-grounding to
+# figure out which figure in the busy multi-pose sheet the text prompt's
+# pose description meant, with no explicit pointer to the right region. That
+# is a real ask, not a guarantee. Cropping to just the ONE relevant panel per
+# generation removes the ambiguity outright: if only one pose is visible,
+# there's nothing else for the grounding to mistakenly latch onto (Andy:
+# "if it only could see a specific angle, then that is the grounding and it
+# should react to that").
+REFERENCE_GUIDE_SIZE = (1670, 942)  # (width, height)
+GUIDE_CROPS = {
+    "01_portrait":      dict(x=0,    y=0, width=508, height=942),
+    "02_front":         dict(x=508,  y=0, width=307, height=942),
+    "04_right_profile": dict(x=815,  y=0, width=237, height=942),
+    "03_left_profile":  dict(x=1052, y=0, width=267, height=942),
+    "05_back":          dict(x=1319, y=0, width=351, height=942),
+}
+# Same proven proportions as the Krea2 node's own ALIGN_GUIDE_KW - normalizes
+# each crop's figure height/placement before it's encoded, independent of
+# TARGET_SIZE (ReferenceLatent doesn't require matching the target's shape).
+ALIGN_POSE_REF_KW = dict(width=544, height=1784, figure_height=1584, bottom_margin=100, threshold=0.1)
+
+# [2026-09-17] Named presets showing the actual final pixel size, not a bare
+# scale multiplier - "1.3x" tells you nothing about what you'll get, and
+# there's no way to reverse-engineer a target size from it without doing the
+# maths yourself (Andy: "who's supposed to know that's the default size").
+# Every panel's proportions stay identical across presets (see
+# _assemble_final) - the character sheet is still a fixed, exact size, you're
+# just picking which fixed size.
+OUTPUT_SIZE_PRESETS = {
+    "4096x2304 (Standard - default)": 1.0,
+    "3072x1728 (Medium)": 0.75,
+    "2048x1152 (Small)": 0.5,
+    "1536x864 (Extra Small)": 0.375,
+}
+
+# [2026-09-30] Unlike FLUX.2, Qwen Image 2.1 takes a real negative prompt -
+# it only has an effect at cfg > 1 (the official note: "negative_prompt:
+# unused while cfg is 1"), which is why this node defaults to cfg 4. It is a
+# widget, applied to every pose and every edit. The references are fed to
+# the negative too (TextEncodeQwenImage21 does that itself), so the negative
+# only steers away from the listed faults, not away from the character.
+DEFAULT_NEGATIVE = (
+    "blurry, low quality, distorted anatomy, deformed hands, extra limbs, extra fingers, "
+    "cropped head, cropped feet, out of frame, multiple people, duplicate figure, text, "
+    "watermark, busy background, patterned background, harsh shadows"
+)
+
+# [2026-09-30] Klein chained the pose guide in as a silent extra
+# ReferenceLatent the prompt never mentioned. Qwen's text encoder SEES every
+# reference (they're labelled <image1>, <image2> in its template), so an
+# unexplained second image is an invitation to blend both - the guide is
+# named here and fenced off as pose-only. Appended only when a
+# pose_reference_image is connected. Untested wording - see RENDER-LOG.
+POSE_REF_SUFFIX = (
+    " Match the body pose and camera angle of the figure in image 2. Image 2 is only a "
+    "pose guide: do not copy its appearance, colors or clothing."
+)
+
+# [2026-09-19] Single-reference, text-described poses - proven in real testing
+# against this exact workflow (Flux Klein 1 Image Ref.json). "The person in
+# image 1" anchors identity/outfit to the one reference; everything else is a
+# concrete, generic pose description with no image-specific detail, so the
+# same prompt works for any character photo dropped in - see Andy's explicit
+# requirement that this NOT be hardcoded to one specific photo's content.
+POSE_PROMPTS = {
+    "01_portrait": (
+        "The person in image 1, close-up portrait cropped to head and shoulders only, "
+        "facing straight to camera, shoulders square and level, on a plain white "
+        "background. Same face, hairstyle, skin tone and outfit unchanged."
+    ),
+    "02_front": (
+        "The person in image 1, full body visible from head to toe, standing straight "
+        "facing the camera, arms relaxed by their sides, feet shoulder-width apart, on a "
+        "plain white background. Same face, hairstyle, skin tone and outfit unchanged."
+    ),
+    "03_left_profile": (
+        "The person in image 1, full body visible from head to toe, body turned to show "
+        "a side profile facing left, arms relaxed by their sides, on a plain white "
+        "background. Same face, hairstyle, skin tone and outfit unchanged."
+    ),
+    "04_right_profile": (
+        "The person in image 1, full body visible from head to toe, body turned to show "
+        "a side profile facing right, arms relaxed by their sides, on a plain white "
+        "background. Same face, hairstyle, skin tone and outfit unchanged."
+    ),
+    "05_back": (
+        "The person in image 1, full body visible from head to toe, viewed directly from "
+        "behind, standing straight, arms relaxed by their sides, on a plain white "
+        "background. Same hairstyle and outfit unchanged, back of the outfit clearly visible."
+    ),
+}
+
+RMBG_KW = dict(
+    model="RMBG-2.0", sensitivity=1.0, process_res=1024, mask_blur=0, mask_offset=0,
+    invert_output=False, refine_foreground=False, background="Color", background_color="#ffffff",
+)
+
+DEFAULT_PROMPTS = [POSE_PROMPTS[name] for name in POSE_NAMES]
+DEFAULT_STATE = {
+    "seeds": list(DEFAULT_SEEDS), "confirmed": [False] * 5, "action": None,
+    "prompts": list(DEFAULT_PROMPTS),
+}
+
+# Face-detail (Impact Pack FaceDetailer) pass, run on each pose right after decode.
+# Identical mechanism to the Krea2 node's - reused as-is, model-family-agnostic.
+FACE_DETAIL_DETECTOR_MODELS = {
+    "face": "bbox/face_yolov8m.pt",
+    "hand": "bbox/hand_yolov8s.pt",
+    "person": "segm/person_yolov8m-seg.pt",
+}
+FACE_DETAIL_STEPS = 4
+# [2026-09-20] bbox_threshold 0.50 -> 0.75 and drop_size 10 -> 40 after a
+# first malfunction: on one FLUX.2 [klein] generation, the face detector
+# returned 300 "faces" in a single 640x224 image (a real face there fills a
+# large fraction of the frame, per the SAME run's portrait-pose detection:
+# "640x384 1 face").
+# [2026-09-17] That threshold tightening reduced false positives on most
+# poses but did NOT hold on every image - confirmed live, the exact same
+# 300-detection storm recurred on a different pose after the fix. The real
+# problem was architectural: FaceDetailer has no built-in cap on how many
+# detected regions it refines, full stop - it dutifully ran a full
+# encode/sample/decode pass for every single one, which is what an "is this
+# run going mad? we're on 76/96 now" report was actually seeing both times.
+# Threshold tuning can only ever lower the ODDS of a false-positive storm,
+# never guarantee it can't happen again on some other image. Rebuilt on
+# Impact Pack's SEGS pipeline instead (see _face_detail): detect -> keep
+# ONLY the single largest region -> refine just that one. There's only ever
+# one real face in these poses, so this is a hard structural cap, not
+# another number to tune and hope. (The Krea2 sibling node's
+# character_sheet_director.py had the same FaceDetailer-based vulnerability -
+# ported the same SEGS rebuild there too.)
+FACE_DETAIL_BBOX_KW = dict(threshold=0.75, dilation=10, crop_factor=2.0, drop_size=40, labels="all")
+FACE_DETAIL_DETAILER_KW = dict(guide_size=1536.0, guide_size_for=False, max_size=1536.0, noise_mask_feather=10)
+FACE_DETAIL_PASTE_KW = dict(feather=10, alpha=255)
+
+_MODEL_CACHE = {"key": None}
+_DETECTOR_CACHE = {"key": None}
+_SESSIONS = {}
+
+
+def _node(name):
+    cls = comfy_nodes.NODE_CLASS_MAPPINGS.get(name)
+    if cls is None:
+        raise RuntimeError(
+            f"[MuseCharacterSheetQwen] Required node '{name}' is not registered. "
+            f"Check that its custom_nodes package is installed and loaded."
+        )
+    return cls()
+
+
+def _tensor_hash(t):
+    arr = t.detach().to("cpu", torch.float32).contiguous().numpy()
+    return hashlib.sha1(arr.tobytes()).hexdigest()
+
+
+def _signature(character_image, pose_reference_image, unet_name, clip_name, vae_name,
+               cache_device, cache_dtype, steps, cfg, negative_prompt, ref_resolution,
+               face_detail, face_detail_type, face_detail_sampler, face_detail_scheduler, face_detail_denoise,
+               model_override=None, clip_override=None, vae_override=None):
+    payload = [
+        _tensor_hash(character_image),
+        # None<->tensor changes the sig just like character_image does, so
+        # plugging/unplugging or swapping the pose guide invalidates the session.
+        _tensor_hash(pose_reference_image) if pose_reference_image is not None else None,
+        unet_name, clip_name, vae_name, cache_device, cache_dtype, int(steps), round(float(cfg), 4),
+        negative_prompt, int(ref_resolution),
+        bool(face_detail), face_detail_type, face_detail_sampler, face_detail_scheduler,
+        round(float(face_detail_denoise), 4),
+        # Boolean presence only, not id() - keying a session wipe off object
+        # identity across separate /prompt submissions made a single reroll
+        # click regenerate all 5 poses (Klein/Krea2 history).
+        model_override is not None, clip_override is not None, vae_override is not None,
+    ]
+    return hashlib.sha1(json.dumps(payload).encode("utf-8")).hexdigest()
+
+
+def _get_models(unet_name, clip_name, vae_name, cache_device, cache_dtype,
+                model_override=None, clip_override=None, vae_override=None):
+    """[2026-09-30] Qwen Image 2.1 already runs its own reference KV cache in
+    "auto" mode by default, so unlike Klein's FluxKVCache nothing needs
+    switching on per checkpoint. QwenImage21Cache is only applied when the
+    cache widgets are moved off auto/default - and, unlike FluxKVCache, it
+    is safe on any Qwen 2.1 model, including one from model_override."""
+    key = (
+        unet_name, clip_name, vae_name, cache_device, cache_dtype,
+        id(model_override) if model_override is not None else None,
+        id(clip_override) if clip_override is not None else None,
+        id(vae_override) if vae_override is not None else None,
+    )
+    if _MODEL_CACHE.get("key") == key:
+        return _MODEL_CACHE
+
+    print(f"[MuseCharacterSheetQwen] loading models: {key}", flush=True)
+    model = model_override if model_override is not None else _node("UNETLoader").load_unet(unet_name, "default")[0]
+    if cache_device != "auto" or cache_dtype != "default":
+        model = _node("QwenImage21Cache").execute(model=model, device=cache_device, dtype=cache_dtype)[0]
+        print(f"[MuseCharacterSheetQwen] reference cache: device={cache_device} dtype={cache_dtype}", flush=True)
+    clip = clip_override if clip_override is not None else _node("CLIPLoader").load_clip(clip_name, "qwen_image", "default")[0]
+    vae = vae_override if vae_override is not None else _node("VAELoader").load_vae(vae_name)[0]
+
+    _MODEL_CACHE.clear()
+    _MODEL_CACHE.update({"key": key, "model": model, "clip": clip, "vae": vae})
+    return _MODEL_CACHE
+
+
+def _get_detector(detector_type):
+    model_name = FACE_DETAIL_DETECTOR_MODELS[detector_type]
+    if _DETECTOR_CACHE.get("key") == model_name:
+        return _DETECTOR_CACHE
+    print(f"[MuseCharacterSheetQwen] loading detector: {model_name}", flush=True)
+    bbox_detector, _segm_detector = _node("UltralyticsDetectorProvider").doit(model_name)
+    _DETECTOR_CACHE.clear()
+    _DETECTOR_CACHE.update({"key": model_name, "bbox_detector": bbox_detector})
+    return _DETECTOR_CACHE
+
+
+def _ensure_rgb(image):
+    return image[..., :3] if image.shape[-1] > 3 else image
+
+
+def _resize(image, width, height, method="lanczos"):
+    samples = image.movedim(-1, 1)
+    samples = comfy.utils.common_upscale(samples, width, height, method, "disabled")
+    return samples.movedim(1, -1)
+
+
+def _scaled_crop(pose_name, guide_image):
+    """Identical mechanism to the Krea2 sibling node's own _scaled_crop -
+    scales GUIDE_CROPS' rectangles (tuned to REFERENCE_GUIDE_SIZE) to whatever
+    actual resolution the supplied pose_reference_image happens to be."""
+    ref_w, ref_h = REFERENCE_GUIDE_SIZE
+    actual_h, actual_w = guide_image.shape[1], guide_image.shape[2]
+    sx, sy = actual_w / ref_w, actual_h / ref_h
+    rect = GUIDE_CROPS[pose_name]
+    x = int(round(rect["x"] * sx))
+    y = int(round(rect["y"] * sy))
+    w = int(round(rect["width"] * sx))
+    h = int(round(rect["height"] * sy))
+    x = max(0, min(x, actual_w - 1))
+    y = max(0, min(y, actual_h - 1))
+    w = max(1, min(w, actual_w - x))
+    h = max(1, min(h, actual_h - y))
+    return x, y, w, h
+
+
+def _crop(image, x, y, w, h):
+    return image[:, y:y + h, x:x + w, :]
+
+
+def _face_detail(image, model, positive, negative, models, seed, cfg,
+                  face_detail_type, face_detail_sampler, face_detail_scheduler, face_detail_denoise):
+    """[2026-09-17] SEGS pipeline, not a direct FaceDetailer call - see the
+    FACE_DETAIL_* constants' comment for why. detect (BboxDetectorSEGS) ->
+    keep only the single largest region (ImpactSEGSOrderedFilter,
+    take_count=1) -> refine just that one (SEGSDetailer) -> composite back
+    onto the full image (SEGSPaste). However many "faces" the detector
+    reports - 1 or 300 - exactly one refine pass ever runs."""
+    detector = _get_detector(face_detail_type)
+    print(f"[MuseCharacterSheetQwen] >>> face-detail pass START (detect={face_detail_type}, "
+          f"sampler={face_detail_sampler}, scheduler={face_detail_scheduler}, "
+          f"denoise={face_detail_denoise}, steps={FACE_DETAIL_STEPS})", flush=True)
+    raw_segs = _node("BboxDetectorSEGS").doit(
+        bbox_detector=detector["bbox_detector"], image=image, **FACE_DETAIL_BBOX_KW,
+    )[0]
+    largest_seg, _ = _node("ImpactSEGSOrderedFilter").doit(
+        segs=raw_segs, target="area(=w*h)", order=True, take_start=0, take_count=1,
+    )
+    found = len(largest_seg[1]) > 0
+    if not found:
+        print("[MuseCharacterSheetQwen] <<< face-detail pass END - NO region detected, image unchanged", flush=True)
+        return image
+    basic_pipe = _node("ToBasicPipe").doit(
+        model=model, clip=models["clip"], vae=models["vae"], positive=positive, negative=negative,
+    )[0]
+    refined_segs, _ = _node("SEGSDetailer").doit(
+        image=image, segs=largest_seg, seed=int(seed), steps=FACE_DETAIL_STEPS, cfg=float(cfg),
+        sampler_name=face_detail_sampler, scheduler=face_detail_scheduler, denoise=float(face_detail_denoise),
+        noise_mask=True, force_inpaint=True, basic_pipe=basic_pipe, refiner_ratio=0.2, batch_size=1, cycle=1,
+        **FACE_DETAIL_DETAILER_KW,
+    )
+    result_image = _node("SEGSPaste").doit(image=image, segs=refined_segs, **FACE_DETAIL_PASTE_KW)[0]
+    print("[MuseCharacterSheetQwen] <<< face-detail pass END - region found and refined", flush=True)
+    return result_image
+
+
+def _encode(models, prompt, negative_prompt, images, ref_resolution):
+    """[2026-09-30] One TextEncodeQwenImage21 call replaces Klein's
+    CLIPTextEncode + ReferenceLatent + ConditioningZeroOut chain. Each image
+    is shown to the Qwen3-VL encoder (as <imageN>) AND spliced into the DiT
+    sequence as a VAE latent, on both positive and negative. Returns
+    (positive, negative, latent) - latent is empty and sized to image 1."""
+    named = {f"image_{n}": img for n, img in enumerate(images, 1)}
+    out = _node("TextEncodeQwenImage21").execute(
+        clip=models["clip"], prompt=prompt, negative_prompt=negative_prompt, vae=models["vae"],
+        resolution=int(ref_resolution), images=named,
+    )
+    return out[0], out[1], out[2]
+
+
+def _empty_latent(width, height):
+    # Qwen Image 2.1 latents are 64 channels at 1/16 scale (latent_formats.QwenImage21)
+    # - EmptyFlux2LatentImage's 128 channels would not fit.
+    samples = torch.zeros([1, 64, height // 16, width // 16], device=comfy.model_management.intermediate_device())
+    return {"samples": samples}
+
+
+def _sample(models, seed, steps, cfg, positive, negative, latent):
+    sampled = _node("KSampler").sample(
+        model=models["model"], seed=int(seed), steps=int(steps), cfg=float(cfg),
+        sampler_name="euler", scheduler="simple",
+        positive=positive, negative=negative, latent_image=latent, denoise=1.0,
+    )[0]
+    return _node("VAEDecode").decode(vae=models["vae"], samples=sampled)[0]
+
+
+def _generate_pose(pose_idx, character_image, pose_ref_image, models, seed, prompt,
+                    steps, cfg, negative_prompt, ref_resolution, cond_cache,
+                    face_detail, face_detail_type, face_detail_sampler, face_detail_scheduler, face_detail_denoise):
+    pose_name = POSE_NAMES[pose_idx]
+    target_w, target_h = TARGET_SIZE[pose_name]
+
+    # The VL encoder pass over 1-2 reference images is the expensive part of
+    # conditioning, and a "New seed" re-roll doesn't change it - cache per
+    # (pose, prompt). negative_prompt/ref_resolution/refs are in the session
+    # signature, so a change there clears the whole session, cache included.
+    key = (pose_idx, prompt)
+    if key not in cond_cache:
+        images = [character_image]
+        text = prompt
+        if pose_ref_image is not None:
+            images.append(pose_ref_image)
+            text = prompt + POSE_REF_SUFFIX
+        positive, negative, _ = _encode(models, text, negative_prompt, images, ref_resolution)
+        cond_cache[key] = (positive, negative)
+    positive, negative = cond_cache[key]
+
+    # Fixed per-pose canvas (not the encoder's latent, which follows the
+    # character photo's aspect) - a new pose is wanted here, not a
+    # pixel-aligned edit, so the "other sizes shift the edit" caveat is moot.
+    decoded = _sample(models, seed, steps, cfg, positive, negative, _empty_latent(target_w, target_h))
+
+    if face_detail:
+        decoded = _face_detail(
+            decoded, models["model"], positive, negative, models, seed, cfg,
+            face_detail_type, face_detail_sampler, face_detail_scheduler, face_detail_denoise,
+        )
+
+    # Background cleanup here (not just at final assembly) so the per-pose
+    # preview the user reviews/confirms already shows the finished white
+    # background.
+    clean_image, mask, _ = _node("RMBG").process_image(image=decoded, **RMBG_KW)
+    return clean_image, mask
+
+
+def _edit_pose(source_image, instruction, models, seed, steps, cfg, negative_prompt, ref_resolution,
+               face_detail, face_detail_type, face_detail_sampler, face_detail_scheduler, face_detail_denoise):
+    """Targeted follow-up edit on a pose's OWN already-generated pixels (e.g.
+    "add high heel shoes") rather than a fresh regenerate from the original
+    references. [2026-09-30] Samples on the encoder's own latent, which is
+    sized to the source image - TextEncodeQwenImage21 warns that any other
+    size shifts the edit, so this keeps the untouched parts of the pose in
+    place. The pose's stored base prompt is left untouched (see run())."""
+    positive, negative, latent = _encode(models, instruction, negative_prompt, [source_image], ref_resolution)
+    decoded = _sample(models, seed, steps, cfg, positive, negative, latent)
+
+    if face_detail:
+        decoded = _face_detail(
+            decoded, models["model"], positive, negative, models, seed, cfg,
+            face_detail_type, face_detail_sampler, face_detail_scheduler, face_detail_denoise,
+        )
+
+    clean_image, mask, _ = _node("RMBG").process_image(image=decoded, **RMBG_KW)
+    return clean_image, mask
+
+
+def _load_preview_pixels(state, index):
+    """Core file lookup shared by _restore_confirmed_preview (hard-fails if
+    nothing's found, since a confirmed lock has to hold) and the "edit" action
+    (best-effort - an edit request has nothing wrong with it if there simply
+    isn't a prior generation to edit yet, e.g. right after a restart wiped
+    the in-process session; the caller just skips gracefully). Returns
+    pixels or None - never raises."""
+    import os
+    import numpy as np
+    from PIL import Image
+    previews = state.get("previews") or []
+    item = previews[index] if index < len(previews) else None
+    if not item or item.get("type") not in ("temp", "output"):
+        return None
+    base = folder_paths.get_temp_directory() if item["type"] == "temp" else folder_paths.get_output_directory()
+    base = os.path.realpath(base)
+    path = os.path.realpath(os.path.join(base, item.get("subfolder", ""), item.get("filename", "")))
+    if os.path.commonpath([base, path]) != base or not os.path.isfile(path):
+        return None
+    with Image.open(path) as im:
+        return torch.from_numpy(np.array(im.convert("RGB"), dtype=np.float32) / 255.0).unsqueeze(0)
+
+
+def _restore_confirmed_preview(state, index, seed, prompt):
+    """Identical mechanism to the Krea2 node's - see that file's docstring for
+    the full rationale. A confirmed pose is a lock that has to survive both a
+    settings change and a ComfyUI restart; this reloads its accepted pixels
+    from the saved preview file instead of silently regenerating them."""
+    pixels = _load_preview_pixels(state, index)
+    if pixels is None:
+        raise ValueError(
+            f"Confirmed pose {index + 1}'s saved preview file is missing on disk "
+            f"(temp previews can get cleaned up over time). Unconfirm it to regenerate."
+        )
+    _, mask, _ = _node("RMBG").process_image(image=pixels, **RMBG_KW)
+    return {"seed": seed, "prompt": prompt, "image": pixels, "mask": mask}
+
+
+def _assemble_final(sess, output_scale=1.0):
+    """[2026-09-17] output_scale (default 1.0 = the original 4096x2304)
+    uniformly scales every panel's dimensions - portrait width/height and the
+    body panels' width/height/figure_height/bottom_margin all move together,
+    so proportions stay identical to the tuned defaults; only the overall
+    size changes. Requested via a YouTube comment asking for a configurable
+    final resolution."""
+    scale = float(output_scale)
+    portrait_size = (round(PORTRAIT_FINAL_SIZE[0] * scale), round(PORTRAIT_FINAL_SIZE[1] * scale))
+    align_kw = {**ALIGN_BODY_KW,
+                "width": round(ALIGN_BODY_KW["width"] * scale),
+                "height": round(ALIGN_BODY_KW["height"] * scale),
+                "figure_height": round(ALIGN_BODY_KW["figure_height"] * scale),
+                "bottom_margin": round(ALIGN_BODY_KW["bottom_margin"] * scale)}
+    panels = []
+    for i in range(5):
+        pose = sess["poses"][i]
+        if i == 0:
+            panel = _resize(pose["image"], *portrait_size)
+        else:
+            panel = _node("MuseSheetAlignFigure").align(image=pose["image"], mask=pose["mask"], **align_kw)[0]
+        panels.append(panel)
+    return torch.cat(panels, dim=2)
+
+
+def _preview(image, persist=False):
+    node = _node("SaveImage") if persist else _node("PreviewImage")
+    kwargs = {"images": image}
+    if persist:
+        kwargs["filename_prefix"] = "MuseCharacterSheetQwen"
+    result = node.save_images(**kwargs)
+    return result["ui"]["images"][0]
+
+
+def _combo(folder, preferred):
+    """File dropdown that defaults to the Qwen Image 2.1 file when it's installed."""
+    files = folder_paths.get_filename_list(folder)
+    opts = {}
+    if preferred in files:
+        opts["default"] = preferred
+    return (files, opts)
+
+
+class MuseCharacterSheetQwen:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "character_image": ("IMAGE", {"tooltip": "Reference photo of the character/outfit, used for every pose (image 1)."}),
+                "unet_name": _combo("diffusion_models", "qwen_image_2.1_bf16.safetensors"),
+                "clip_name": _combo("text_encoders", "qwen3vl_8b_bf16.safetensors"),
+                "vae_name": _combo("vae", "qwen_image_2.1_vae_bf16.safetensors"),
+                "cache_device": (["auto", "gpu", "cpu", "off"], {"default": "auto", "tooltip": "Qwen Image 2.1 reference KV cache (QwenImage21Cache). 'auto' is the model's own default: spare VRAM, then RAM. 'cpu' costs little speed; 'off' recomputes every step."}),
+                "cache_dtype": (["default", "int8", "int4"], {"default": "default", "tooltip": "KV cache storage precision. 'default' is lossless; 'int8' halves it at about bf16 accuracy - try it if VRAM-starved."}),
+                "steps": ("INT", {"default": 40, "min": 1, "max": 100, "tooltip": "Qwen Image 2.1 is not step-distilled - the official pipeline uses about 40-50 with euler."}),
+                "cfg": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "The negative prompt only has an effect above 1."}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": DEFAULT_NEGATIVE, "tooltip": "Applied to every pose and every edit. Ignored at cfg 1."}),
+                "ref_resolution": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 32, "tooltip": "Reference images are resized to about this x this pixels (aspect kept) before the text encoder and VAE see them."}),
+                "face_detail": ("BOOLEAN", {"default": False, "tooltip": "Run a FaceDetailer pass on each pose to fix soft/plastic faces."}),
+                "face_detail_type": (list(FACE_DETAIL_DETECTOR_MODELS.keys()), {"default": "face"}),
+                "face_detail_sampler": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
+                "face_detail_scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple"}),
+                "face_detail_denoise": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "seed_mode": (["random", "fixed"], {"default": "random", "tooltip": "What starting seeds a fresh run gets AFTER a completed sheet resets (not the per-pose New seed button, which always picks a fresh random seed regardless). 'random' means running again with the same character photo produces different poses without needing a new image; 'fixed' always starts from the same seeds (41001-41005), so a re-run reproduces the same result."}),
+                "state_json": ("STRING", {"multiline": True, "default": json.dumps(DEFAULT_STATE)}),
+                # New widgets go at the true end, never mid-list - saved
+                # widgets_values are positional (Klein history).
+                "output_size": (list(OUTPUT_SIZE_PRESETS.keys()), {"default": "4096x2304 (Standard - default)", "tooltip": "Final assembled sheet size - pick the exact pixel dimensions you want. Every panel's proportions stay identical across presets, only the overall size changes. Only affects the final Build step, not the per-pose generation/preview resolution."}),
+            },
+            # Purely additive override pattern - manual unet_name/clip_name/
+            # vae_name widgets still work standalone; a connected socket wins
+            # over its matching widget (see _get_models()). Overrides must be
+            # Qwen Image 2.1 models (CLIP loaded with type qwen_image).
+            "optional": {
+                "pose_reference_image": ("IMAGE", {"tooltip": "Optional 5-panel mannequin pose guide sheet. Automatically cropped to the ONE matching panel per pose and passed as image 2, with a prompt line saying it is a pose guide only."}),
+                "model_override": ("MODEL", {"tooltip": "Optional. Overrides unet_name when connected."}),
+                "clip_override": ("CLIP", {"tooltip": "Optional. Overrides clip_name when connected."}),
+                "vae_override": ("VAE", {"tooltip": "Optional. Overrides vae_name when connected."}),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("character_sheet",)
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+    CATEGORY = "Muse/Character Sheet"
+    DESCRIPTION = (
+        "Generates a 5-pose Qwen Image 2.1 character sheet from a single character reference "
+        "photo (no guide sheet required - poses are described directly in text). Optionally "
+        "connect a pose_reference_image mannequin sheet as a pose guide (image 2). Confirm or "
+        "re-roll each pose in the node's own UI; once all five are confirmed, click Build "
+        "final sheet now to assemble the final 4096x2304 sheet."
+    )
+
+    def run(self, character_image, unet_name, clip_name, vae_name, cache_device, cache_dtype, steps, cfg,
+            negative_prompt, ref_resolution,
+            face_detail, face_detail_type, face_detail_sampler, face_detail_scheduler, face_detail_denoise,
+            seed_mode, output_size, state_json, unique_id, pose_reference_image=None, model_override=None, clip_override=None, vae_override=None):
+        character_image = _ensure_rgb(character_image)
+        if pose_reference_image is not None:
+            pose_reference_image = _ensure_rgb(pose_reference_image)
+        try:
+            state = json.loads(state_json) if state_json else {}
+        except (TypeError, ValueError):
+            state = {}
+        seeds = [int(s) for s in (state.get("seeds") or DEFAULT_SEEDS)]
+        confirmed = list(state.get("confirmed") or [False] * 5)
+        prompts = list(state.get("prompts") or DEFAULT_PROMPTS)
+        if len(prompts) != 5:
+            prompts = list(DEFAULT_PROMPTS)
+        action = state.get("action")
+
+        sig = _signature(character_image, pose_reference_image, unet_name, clip_name, vae_name,
+                          cache_device, cache_dtype, steps, cfg, negative_prompt, ref_resolution,
+                          face_detail, face_detail_type, face_detail_sampler, face_detail_scheduler, face_detail_denoise,
+                          model_override, clip_override, vae_override)
+        sess = _SESSIONS.setdefault(str(unique_id), {})
+        if sess.get("sig") != sig:
+            retained = {i: p for i, p in sess.get("poses", {}).items() if i < len(confirmed) and confirmed[i]}
+            sess.clear()
+            sess["sig"] = sig
+            sess["poses"] = retained
+            if not (action and action.get("type") == "finalize"):
+                action = None
+
+        for i in range(5):
+            if confirmed[i] and sess["poses"].get(i) is None:
+                sess["poses"][i] = _restore_confirmed_preview(state, i, seeds[i], prompts[i])
+
+        models = _get_models(unet_name, clip_name, vae_name, cache_device, cache_dtype,
+                             model_override, clip_override, vae_override)
+        cond_cache = sess.setdefault("cond_cache", {})
+
+        if "pose_refs" not in sess:
+            # One cropped + aligned pixel image PER POSE (never the whole
+            # sheet - see GUIDE_CROPS). Kept as pixels, not latents:
+            # TextEncodeQwenImage21 needs the image itself for the VL encoder.
+            if pose_reference_image is not None:
+                sess["pose_refs"] = {}
+                for idx, pose_name in enumerate(POSE_NAMES):
+                    x, y, w, h = _scaled_crop(pose_name, pose_reference_image)
+                    pose_crop = _crop(pose_reference_image, x, y, w, h)
+                    if idx == 0:
+                        sess["pose_refs"][idx] = pose_crop
+                    else:
+                        sess["pose_refs"][idx] = _node("MuseSheetAlignFigure").align(image=pose_crop, mask=None, **ALIGN_POSE_REF_KW)[0]
+            else:
+                sess["pose_refs"] = {idx: None for idx in range(5)}
+
+        if action and action.get("type") == "reroll":
+            i = int(action["pose"])
+            if not confirmed[i]:
+                seeds[i] = int(action["seed"])
+
+        def run_edit(i, source_image, instruction):
+            """Runs _edit_pose and stores the result, tagged with the
+            instruction and the SOURCE it was applied to (edit_source_image) -
+            that tag is what makes reroll_edit() below possible: re-running
+            the same instruction with a new seed from the same starting
+            point, instead of stacking onto whatever the previous edit
+            produced. A plain fresh generation (the normal to_generate loop)
+            always overwrites sess["poses"][i] with a brand-new dict that has
+            no edit_instruction/edit_source_image keys at all, so an old edit
+            tag can never survive into a genuinely fresh pose by accident.
+            [2026-09-23] Deliberately does NOT fold the pose's base prompt in
+            here (an earlier attempt at that did) - every POSE_PROMPTS entry
+            contains "Same face, hairstyle, skin tone and outfit unchanged",
+            which directly contradicts any edit instruction that changes
+            clothing, and was confirmed to cause visible color bleed/merging
+            (Andy: "the weird saturated color... merging things together").
+            instruction alone is what actually gets sent as text
+            conditioning."""
+            image, mask = _edit_pose(
+                source_image, instruction, models, seeds[i], steps, cfg, negative_prompt, ref_resolution,
+                face_detail, face_detail_type, face_detail_sampler, face_detail_scheduler, face_detail_denoise,
+            )
+            sess["poses"][i] = {
+                "seed": seeds[i], "prompt": prompts[i], "image": image, "mask": mask,
+                "edit_instruction": instruction, "edit_source_image": source_image,
+            }
+            comfy.model_management.soft_empty_cache()
+
+        def apply_edit(i, instruction):
+            """[2026-09-20] A one-off targeted edit of a pose's OWN already-
+            generated pixels (e.g. "add high heel shoes") - not a fresh
+            regenerate from the original character/pose references. Runs
+            before to_generate is computed, so the edited result is already
+            in sess["poses"] by the time that's built - since seed/prompt for
+            this pose are left unchanged, the normal to_generate equality
+            check naturally leaves it alone afterward, no special exclusion
+            needed. Returns True if it actually ran. Shared by both the
+            single-pose "edit" action and "edit_all".
+            """
+            instruction = (instruction or "").strip()
+            if confirmed[i] or not instruction:
+                return False
+            if sess["poses"].get(i) is None:
+                # [2026-09-20] The in-process session is wiped by a ComfyUI
+                # restart (or a settings change on an unconfirmed pose - only
+                # confirmed poses get retained across a sig change). Without
+                # this, an edit request right after a restart found nothing
+                # in sess["poses"], silently skipped, and fell straight
+                # through to a normal fresh regeneration of every unconfirmed
+                # pose - discarding the edit instruction with zero feedback.
+                # Best-effort recovery from the pose's own last saved preview
+                # file closes that gap; if even that comes up empty (file
+                # genuinely gone), the edit is skipped below same as before.
+                pixels = _load_preview_pixels(state, i)
+                if pixels is not None:
+                    sess["poses"][i] = {"seed": seeds[i], "prompt": prompts[i], "image": pixels, "mask": None}
+            if sess["poses"].get(i) is None:
+                return False
+            pose = sess["poses"][i]
+            prior_instruction = pose.get("edit_instruction")
+            if prior_instruction:
+                # [2026-09-22] Anchor off the SAME pristine pre-edit pixels
+                # every time (edit_source_image), not this edit's own output -
+                # this is a full denoise=1.0 regeneration guided to resemble
+                # its source, not a touch-up, so repeatedly feeding it its own
+                # prior output compounds like a photocopy of a photocopy
+                # (visible as color drift after 3-4 stacked edits). Folding
+                # the new instruction in alongside the old one keeps this a
+                # SINGLE full regeneration off a clean source instead of a
+                # chain of them.
+                base_image = pose["edit_source_image"]
+                combined_instruction = f"{prior_instruction}; {instruction}"
+            else:
+                base_image = pose["image"]
+                combined_instruction = instruction
+            pose_name = POSE_NAMES[i]
+            print(f"[MuseCharacterSheetQwen] editing {pose_name}: {combined_instruction}", flush=True)
+            run_edit(i, base_image, combined_instruction)
+            return True
+
+        def reroll_edit(i, new_seed):
+            """[2026-09-20] "New seed" on a pose that currently has an active
+            edit re-runs THAT SAME edit instruction with a new seed, sourced
+            from edit_source_image (the pixels the edit was originally
+            applied to) - not the base pose, and not the previous edit
+            result. Without this, the only "New seed" available reverted to
+            the un-edited pose every time, discarding the edit entirely -
+            exactly the behavior Andy flagged. Returns True if it actually
+            re-rolled; False means "nothing to reroll here" (no active edit
+            tracked, most likely because a ComfyUI restart wiped the
+            in-process session - edit_source_image has no disk-backed
+            recovery the way confirmed-pose pixels do), and the caller falls
+            back to a normal base reroll instead of silently doing nothing.
+            """
+            if confirmed[i]:
+                return False
+            pose = sess["poses"].get(i)
+            instruction = pose.get("edit_instruction") if pose else None
+            source_image = pose.get("edit_source_image") if pose else None
+            if not instruction or source_image is None:
+                return False
+            seeds[i] = int(new_seed)
+            pose_name = POSE_NAMES[i]
+            print(f"[MuseCharacterSheetQwen] re-rolling edit on {pose_name}: {instruction} (seed={seeds[i]})", flush=True)
+            run_edit(i, source_image, instruction)
+            return True
+
+        if action and action.get("type") == "edit":
+            apply_edit(int(action["pose"]), action.get("instruction"))
+        elif action and action.get("type") == "edit_all":
+            # [2026-09-20] Same edit, applied to every UNCONFIRMED pose in one
+            # go - confirmed/locked poses are silently skipped, same lock
+            # semantics as everything else in this node.
+            instruction = action.get("instruction")
+            for i in range(5):
+                apply_edit(i, instruction)
+        elif action and action.get("type") == "reroll_edit":
+            i = int(action["pose"])
+            if not reroll_edit(i, action["seed"]):
+                # Nothing to reroll (see reroll_edit's docstring) - fall back
+                # to a normal base reroll rather than doing nothing at all.
+                if not confirmed[i]:
+                    seeds[i] = int(action["seed"])
+        elif action and action.get("type") == "reset_edit":
+            # [2026-09-17] Cancels an active edit and reverts to the plain
+            # base pose - requested via a YouTube comment (edit an outfit,
+            # decide you don't want it, but there was no way back to the
+            # un-edited version short of retyping the base prompt). Just
+            # dropping the cached pose is enough: seed/prompt haven't
+            # changed, so to_generate's mismatch check won't catch it on its
+            # own, but with no cached entry at all it unconditionally
+            # regenerates at the CURRENT seed/prompt - a plain base
+            # generation, since sess["poses"][i] never had edit_instruction/
+            # edit_source_image keys to begin with once rebuilt this way.
+            i = int(action["pose"])
+            if not confirmed[i]:
+                sess["poses"].pop(i, None)
+        elif action and action.get("type") == "reset_prompt":
+            # [2026-09-17] "Reset prompt to default" - Andy: "even if you
+            # change it and mess it all up, you can hit default prompt and
+            # it will do that." Reverts this pose's prompt back to its
+            # built-in POSE_PROMPTS text and lets it regenerate with it -
+            # the normal to_generate mismatch check (prompt changed) picks
+            # this up on its own, no special regeneration path needed.
+            i = int(action["pose"])
+            if not confirmed[i]:
+                prompts[i] = DEFAULT_PROMPTS[i]
+        elif not action and seed_mode == "random":
+            # [2026-09-23] A bare "hit Run" (no button clicked - action is
+            # None) used to just replay whatever was already cached, since
+            # nothing about seeds/prompts/settings had changed - correct for
+            # avoiding wasted GPU work, but not what Andy actually wants:
+            # a normal ComfyUI workflow with a random seed regenerates every
+            # single time you queue it, full stop, no extra clicks required.
+            # This reroll-everything-unconfirmed-on-a-bare-run is what makes
+            # that true here too, while "fixed" mode (or a confirmed pose)
+            # keeps the old reproducible/locked behavior untouched. Any
+            # EXPLICIT action (reroll/edit/reroll_edit/finalize) already sets
+            # its own seed(s) above and is excluded by the `not action` check,
+            # so this can't double-randomize a pose the user just picked.
+            for i in range(5):
+                if not confirmed[i]:
+                    seeds[i] = random.randint(0, 2 ** 31 - 1)
+
+        to_generate = [i for i in range(5)
+                       if not confirmed[i] and (
+                           sess["poses"].get(i) is None
+                           or sess["poses"][i]["seed"] != seeds[i]
+                           or sess["poses"][i]["prompt"] != prompts[i]
+                       )]
+        for i in to_generate:
+            print(f"[MuseCharacterSheetQwen] generating {POSE_NAMES[i]} (seed={seeds[i]})", flush=True)
+            image, mask = _generate_pose(i, character_image, sess["pose_refs"][i], models,
+                                          seeds[i], prompts[i], steps, cfg, negative_prompt, ref_resolution, cond_cache,
+                                          face_detail, face_detail_type, face_detail_sampler,
+                                          face_detail_scheduler, face_detail_denoise)
+            sess["poses"][i] = {"seed": seeds[i], "prompt": prompts[i], "image": image, "mask": mask}
+            comfy.model_management.soft_empty_cache()
+
+        want_finalize = bool(action) and action.get("type") == "finalize"
+        final_image = None
+        if want_finalize:
+            if not all(confirmed):
+                status = "not_all_confirmed"
+            else:
+                print("[MuseCharacterSheetQwen] assembling final sheet", flush=True)
+                final_image = _assemble_final(sess, OUTPUT_SIZE_PRESETS.get(output_size, 1.0))
+                status = "finalized"
+        else:
+            status = "generating" if to_generate else "ready"
+
+        pose_previews = [_preview(sess["poses"][i]["image"], persist=confirmed[i]) for i in range(5)]
+        ui = {
+            "pose_previews": pose_previews,
+            "pose_labels": POSE_LABELS,
+            "seeds": seeds,
+            "prompts": prompts,
+            "confirmed": confirmed,
+            "status": [status],
+        }
+        if final_image is not None:
+            sess.clear()
+            # [2026-09-20] seed_mode governs ONLY this post-finalize reset -
+            # per-pose "New seed" always picks a fresh random seed regardless
+            # of this setting (see the reroll action, unchanged). Without a
+            # "random" option here, running the SAME character photo again
+            # after a completed sheet would always restart from the exact
+            # same DEFAULT_SEEDS and produce byte-identical poses - the only
+            # way to get a different result would be feeding in a different
+            # image, which isn't what "just click Run again" should require.
+            if seed_mode == "random":
+                ui["seeds"] = [random.randint(0, 2 ** 31 - 1) for _ in range(5)]
+            else:
+                ui["seeds"] = list(DEFAULT_SEEDS)
+            ui["confirmed"] = [False] * 5
+            ui["reset"] = [True]
+
+        result = (final_image,) if final_image is not None else (ExecutionBlocker(None),)
+        return {"ui": ui, "result": result}
+
+
+NODE_CLASS_MAPPINGS = {"MuseCharacterSheetQwen": MuseCharacterSheetQwen}
+NODE_DISPLAY_NAME_MAPPINGS = {"MuseCharacterSheetQwen": "Muse Character Sheet (Qwen Image 2.1)"}
