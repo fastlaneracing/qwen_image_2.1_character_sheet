@@ -386,7 +386,14 @@ def _sample(models, seed, steps, cfg, positive, negative, latent):
         sampler_name="euler", scheduler="simple",
         positive=positive, negative=negative, latent_image=latent, denoise=1.0,
     )[0]
-    return _node("VAEDecode").decode(vae=models["vae"], samples=sampled)[0]
+    decoded = _node("VAEDecode").decode(vae=models["vae"], samples=sampled)[0]
+    # [2026-09-30] The Qwen Image 2.1 VAE decodes RGBA (4 channels) - RMBG,
+    # face detail and the sheet assembly all expect RGB. Composite over white
+    # (the sheet's own background), same as the text encoder does for refs.
+    if decoded.shape[-1] > 3:
+        alpha = decoded[..., 3:4]
+        decoded = decoded[..., :3] * alpha + (1.0 - alpha)
+    return decoded
 
 
 def _generate_pose(pose_idx, character_image, pose_ref_image, models, seed, prompt,
