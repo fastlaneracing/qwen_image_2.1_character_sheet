@@ -50,8 +50,8 @@ DEFAULT_SEEDS = [41001, 41002, 41003, 41004, 41005]
 # of 16) - a true side-on silhouette is only chest-to-back deep, much
 # narrower than a front-on shoulder-to-shoulder view, so sharing the front
 # pose's canvas width was making the model widen/stockify the body to fill
-# the frame (Andy: "they don't look like they represent the normal height of
-# the person"). Height is unchanged, so ALIGN_BODY_KW's fixed figure_height/
+# the frame, so the figures no longer read as the person's normal height.
+# Height is unchanged, so ALIGN_BODY_KW's fixed figure_height/
 # bottom_margin still line every panel up at the same final height in
 # _assemble_final - only the pre-alignment generation canvas is narrower.
 # [2026-09-30] Qwen port: same sizes, but Qwen Image 2.1 wants multiples of
@@ -71,7 +71,7 @@ PORTRAIT_FINAL_SIZE = (1280, 2304)  # (width, height)
 
 # [2026-09-17] pose_reference_image crop rects - identical to the Krea2
 # sibling node's own GUIDE_CROPS (same mannequin template layout, verified
-# against Codex's original manual "KREA 2 Character Sheet - Pose Guides"
+# against the original manual "KREA 2 Character Sheet - Pose Guides"
 # workflow, byte-identical numbers). Added because the previous approach -
 # feeding the WHOLE 5-panel sheet as one reference, unchanged, for all 5
 # generations - relied entirely on the model's own vision-grounding to
@@ -79,9 +79,7 @@ PORTRAIT_FINAL_SIZE = (1280, 2304)  # (width, height)
 # pose description meant, with no explicit pointer to the right region. That
 # is a real ask, not a guarantee. Cropping to just the ONE relevant panel per
 # generation removes the ambiguity outright: if only one pose is visible,
-# there's nothing else for the grounding to mistakenly latch onto (Andy:
-# "if it only could see a specific angle, then that is the grounding and it
-# should react to that").
+# there's nothing else for the grounding to mistakenly latch onto.
 REFERENCE_GUIDE_SIZE = (1670, 942)  # (width, height)
 GUIDE_CROPS = {
     "01_portrait":      dict(x=0,    y=0, width=508, height=942),
@@ -98,7 +96,7 @@ ALIGN_POSE_REF_KW = dict(width=544, height=1784, figure_height=1584, bottom_marg
 # [2026-09-17] Named presets showing the actual final pixel size, not a bare
 # scale multiplier - "1.3x" tells you nothing about what you'll get, and
 # there's no way to reverse-engineer a target size from it without doing the
-# maths yourself (Andy: "who's supposed to know that's the default size").
+# maths yourself.
 # Every panel's proportions stay identical across presets (see
 # _assemble_final) - the character sheet is still a fixed, exact size, you're
 # just picking which fixed size.
@@ -136,8 +134,8 @@ POSE_REF_SUFFIX = (
 # against this exact workflow (Flux Klein 1 Image Ref.json). "The person in
 # image 1" anchors identity/outfit to the one reference; everything else is a
 # concrete, generic pose description with no image-specific detail, so the
-# same prompt works for any character photo dropped in - see Andy's explicit
-# requirement that this NOT be hardcoded to one specific photo's content.
+# same prompt works for any character photo dropped in - deliberately NOT
+# hardcoded to one specific photo's content.
 POSE_PROMPTS = {
     "01_portrait": (
         "The person in image 1, close-up portrait cropped to head and shoulders only, "
@@ -499,8 +497,7 @@ def _assemble_final(sess, output_scale=1.0):
     uniformly scales every panel's dimensions - portrait width/height and the
     body panels' width/height/figure_height/bottom_margin all move together,
     so proportions stay identical to the tuned defaults; only the overall
-    size changes. Requested via a YouTube comment asking for a configurable
-    final resolution."""
+    size changes, giving a configurable final resolution."""
     scale = float(output_scale)
     portrait_size = (round(PORTRAIT_FINAL_SIZE[0] * scale), round(PORTRAIT_FINAL_SIZE[1] * scale))
     align_kw = {**ALIGN_BODY_KW,
@@ -664,7 +661,7 @@ class MuseCharacterSheetQwen:
             contains "Same face, hairstyle, skin tone and outfit unchanged",
             which directly contradicts any edit instruction that changes
             clothing, and was confirmed to cause visible color bleed/merging
-            (Andy: "the weird saturated color... merging things together").
+            (saturated colors merging together).
             instruction alone is what actually gets sent as text
             conditioning."""
             image, mask = _edit_pose(
@@ -736,7 +733,7 @@ class MuseCharacterSheetQwen:
             applied to) - not the base pose, and not the previous edit
             result. Without this, the only "New seed" available reverted to
             the un-edited pose every time, discarding the edit entirely -
-            exactly the behavior Andy flagged. Returns True if it actually
+            which is not what a re-roll should do. Returns True if it actually
             re-rolled; False means "nothing to reroll here" (no active edit
             tracked, most likely because a ComfyUI restart wiped the
             in-process session - edit_source_image has no disk-backed
@@ -774,7 +771,7 @@ class MuseCharacterSheetQwen:
                     seeds[i] = int(action["seed"])
         elif action and action.get("type") == "reset_edit":
             # [2026-09-17] Cancels an active edit and reverts to the plain
-            # base pose - requested via a YouTube comment (edit an outfit,
+            # base pose (edit an outfit,
             # decide you don't want it, but there was no way back to the
             # un-edited version short of retyping the base prompt). Just
             # dropping the cached pose is enough: seed/prompt haven't
@@ -787,9 +784,8 @@ class MuseCharacterSheetQwen:
             if not confirmed[i]:
                 sess["poses"].pop(i, None)
         elif action and action.get("type") == "reset_prompt":
-            # [2026-09-17] "Reset prompt to default" - Andy: "even if you
-            # change it and mess it all up, you can hit default prompt and
-            # it will do that." Reverts this pose's prompt back to its
+            # [2026-09-17] "Reset prompt to default" - a way back after a
+            # prompt has been edited into a mess. Reverts this pose's prompt back to its
             # built-in POSE_PROMPTS text and lets it regenerate with it -
             # the normal to_generate mismatch check (prompt changed) picks
             # this up on its own, no special regeneration path needed.
@@ -800,7 +796,7 @@ class MuseCharacterSheetQwen:
             # [2026-09-23] A bare "hit Run" (no button clicked - action is
             # None) used to just replay whatever was already cached, since
             # nothing about seeds/prompts/settings had changed - correct for
-            # avoiding wasted GPU work, but not what Andy actually wants:
+            # avoiding wasted GPU work, but not what users expect:
             # a normal ComfyUI workflow with a random seed regenerates every
             # single time you queue it, full stop, no extra clicks required.
             # This reroll-everything-unconfirmed-on-a-bare-run is what makes

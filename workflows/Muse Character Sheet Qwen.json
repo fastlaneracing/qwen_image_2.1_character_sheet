@@ -1,0 +1,432 @@
+{
+  "id": "5d2f6e0a-7c1b-4d0e-9a57-a21c4e7b9f10",
+  "revision": 0,
+  "last_node_id": 10,
+  "last_link_id": 22,
+  "nodes": [
+    {
+      "id": 5,
+      "type": "VRAMCleanup",
+      "pos": [
+        -1470,
+        20
+      ],
+      "size": [
+        230,
+        40
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "shape": 7,
+          "type": "*",
+          "link": 18
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui_memory_cleanup",
+        "ver": "1.1.3",
+        "Node name for S&R": "VRAMCleanup"
+      },
+      "widgets_values": [
+        true,
+        true
+      ],
+      "widgets_values_named": {
+        "offload_model": true,
+        "offload_cache": true
+      }
+    },
+    {
+      "id": 6,
+      "type": "RAMCleanup",
+      "pos": [
+        -1110,
+        10
+      ],
+      "size": [
+        230,
+        40
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "shape": 7,
+          "type": "*",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui_memory_cleanup",
+        "ver": "1.1.3",
+        "Node name for S&R": "RAMCleanup"
+      },
+      "widgets_values": [
+        true,
+        true,
+        true,
+        3
+      ],
+      "widgets_values_named": {
+        "clean_file_cache": true,
+        "clean_processes": true,
+        "clean_dlls": true,
+        "retry_times": 3
+      }
+    },
+    {
+      "id": 4,
+      "type": "SaveImage",
+      "pos": [
+        -770,
+        50
+      ],
+      "size": [
+        940,
+        80
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 19
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.34.2",
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "character_sheet/qwen21_sheet"
+      ],
+      "widgets_values_named": {
+        "filename_prefix": "character_sheet/qwen21_sheet"
+      },
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [
+        -1910,
+        -50
+      ],
+      "size": [
+        500,
+        400
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 4,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            17
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": []
+        }
+      ],
+      "title": "MANNEQUIN LAYOUT - original 5-panel guide",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.34.2",
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "ChatGPT Image Sep 18, 2026, 08_44_04 AM (1).png",
+        "image"
+      ],
+      "widgets_values_named": {
+        "image": "ChatGPT Image Sep 18, 2026, 08_44_04 AM (1).png",
+        "upload": "image"
+      },
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 3,
+      "type": "LoadImage",
+      "pos": [
+        -1920,
+        420
+      ],
+      "size": [
+        510,
+        490
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            16
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": []
+        }
+      ],
+      "title": "Original character / outfit reference - used by ALL views",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.34.2",
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "master.png",
+        "image"
+      ],
+      "widgets_values_named": {
+        "image": "master.png",
+        "upload": "image"
+      },
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 10,
+      "type": "MarkdownNote",
+      "pos": [
+        -2480,
+        -40
+      ],
+      "size": [
+        790,
+        760
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Note: Qwen Image 2.1 character sheet",
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.8",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "# Muse Character Sheet — Qwen Image 2.1\n\nQwen Image 2.1 port of **Muse Character Sheet (Klein)**. Same node UI: a 5-pose turnaround (portrait, front, left profile, right profile, back) from **one character reference photo**, with **Confirm** / **New seed** / **Apply edit** per pose, **Edit all poses**, and **Build final sheet now** (4096x2304 by default).\n\nWhat changed from Klein:\n- The Qwen3-VL text encoder **sees** the reference photo (image 1), and it is also spliced in as a latent (`TextEncodeQwenImage21`, ComfyUI core).\n- A real **negative prompt** (a widget), active because cfg is 4.\n- **40 steps, cfg 4**, euler/simple. Qwen 2.1 is not step-distilled, so expect about 10x Klein's time per pose.\n- The optional mannequin sheet (bypassed loader, top) is cropped per pose and passed as **image 2**, with a prompt line saying it is a pose guide only.\n- `cache_device` / `cache_dtype` drive `QwenImage21Cache`; leave them on auto/default unless you're VRAM-starved (then try dtype int8).\n\n## Required\n- Node pack: [qwen_image_2.1_character_sheet](https://github.com/fastlaneracing/qwen_image_2.1_character_sheet).\n- [ComfyUI-RMBG](https://github.com/1038lab/ComfyUI-RMBG) for the white-background cleanup.\n- Impact Pack + Subpack only if you turn Face Detail on.\n\n## Models ([Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1))\n- `diffusion_models/qwen_image_2.1_bf16.safetensors` (or `qwen_image_2.1_int8_convrot`)\n- `text_encoders/qwen3vl_8b_bf16.safetensors` (or `qwen3vl_8b_int8_convrot`)\n- `vae/qwen_image_2.1_vae_bf16.safetensors`\n"
+      ],
+      "widgets_values_named": {
+        "text": "# Muse Character Sheet — Qwen Image 2.1\n\nQwen Image 2.1 port of **Muse Character Sheet (Klein)**. Same node UI: a 5-pose turnaround (portrait, front, left profile, right profile, back) from **one character reference photo**, with **Confirm** / **New seed** / **Apply edit** per pose, **Edit all poses**, and **Build final sheet now** (4096x2304 by default).\n\nWhat changed from Klein:\n- The Qwen3-VL text encoder **sees** the reference photo (image 1), and it is also spliced in as a latent (`TextEncodeQwenImage21`, ComfyUI core).\n- A real **negative prompt** (a widget), active because cfg is 4.\n- **40 steps, cfg 4**, euler/simple. Qwen 2.1 is not step-distilled, so expect about 10x Klein's time per pose.\n- The optional mannequin sheet (bypassed loader, top) is cropped per pose and passed as **image 2**, with a prompt line saying it is a pose guide only.\n- `cache_device` / `cache_dtype` drive `QwenImage21Cache`; leave them on auto/default unless you're VRAM-starved (then try dtype int8).\n\n## Required\n- Node pack: [qwen_image_2.1_character_sheet](https://github.com/fastlaneracing/qwen_image_2.1_character_sheet).\n- [ComfyUI-RMBG](https://github.com/1038lab/ComfyUI-RMBG) for the white-background cleanup.\n- Impact Pack + Subpack only if you turn Face Detail on.\n\n## Models ([Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1))\n- `diffusion_models/qwen_image_2.1_bf16.safetensors` (or `qwen_image_2.1_int8_convrot`)\n- `text_encoders/qwen3vl_8b_bf16.safetensors` (or `qwen3vl_8b_int8_convrot`)\n- `vae/qwen_image_2.1_vae_bf16.safetensors`\n"
+      },
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 9,
+      "type": "MuseCharacterSheetQwen",
+      "pos": [
+        -1690,
+        -40
+      ],
+      "size": [
+        820,
+        2108
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "character_image",
+          "type": "IMAGE",
+          "link": 16
+        },
+        {
+          "name": "pose_reference_image",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 17
+        },
+        {
+          "name": "model_override",
+          "shape": 7,
+          "type": "MODEL",
+          "link": null
+        },
+        {
+          "name": "clip_override",
+          "shape": 7,
+          "type": "CLIP",
+          "link": null
+        },
+        {
+          "name": "vae_override",
+          "shape": 7,
+          "type": "VAE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "character_sheet",
+          "type": "IMAGE",
+          "links": [
+            18,
+            19
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MuseCharacterSheetQwen"
+      },
+      "widgets_values": [
+        "qwen_image_2.1_bf16.safetensors",
+        "qwen3vl_8b_bf16.safetensors",
+        "qwen_image_2.1_vae_bf16.safetensors",
+        "auto",
+        "default",
+        40,
+        4.0,
+        "blurry, low quality, distorted anatomy, deformed hands, extra limbs, extra fingers, cropped head, cropped feet, out of frame, multiple people, duplicate figure, text, watermark, busy background, patterned background, harsh shadows",
+        1024,
+        false,
+        "face",
+        "euler",
+        "simple",
+        0.3,
+        "random",
+        "{\"seeds\": [1423614429, 1483538921, 2145302279, 1211437390, 1207820841], \"confirmed\": [false, false, false, false, false], \"prompts\": [\"The person in image 1, close-up portrait cropped to head and shoulders only, facing straight to camera, shoulders square and level, on a plain white background. Same face, hairstyle, skin tone and outfit unchanged.\", \"The person in image 1, full body visible from head to toe, standing straight facing the camera, arms relaxed by their sides, feet shoulder-width apart, on a plain white background. Same face, hairstyle, skin tone and outfit unchanged.\", \"The person in image 1, full body visible from head to toe, body turned to show a side profile facing left, arms relaxed by their sides, on a plain white background. Same face, hairstyle, skin tone and outfit unchanged.\", \"The person in image 1, full body visible from head to toe, body turned to show a side profile facing right, arms relaxed by their sides, on a plain white background. Same face, hairstyle, skin tone and outfit unchanged.\", \"The person in image 1, full body visible from head to toe, viewed directly from behind, standing straight, arms relaxed by their sides, on a plain white background. Same hairstyle and outfit unchanged, back of the outfit clearly visible.\"], \"previews\": [null, null, null, null, null], \"editInstructions\": [null, null, null, null, null], \"status\": null, \"action\": null}",
+        "4096x2304 (Standard - default)",
+        ""
+      ],
+      "widgets_values_named": {
+        "unet_name": "qwen_image_2.1_bf16.safetensors",
+        "clip_name": "qwen3vl_8b_bf16.safetensors",
+        "vae_name": "qwen_image_2.1_vae_bf16.safetensors",
+        "cache_device": "auto",
+        "cache_dtype": "default",
+        "steps": 40,
+        "cfg": 4.0,
+        "negative_prompt": "blurry, low quality, distorted anatomy, deformed hands, extra limbs, extra fingers, cropped head, cropped feet, out of frame, multiple people, duplicate figure, text, watermark, busy background, patterned background, harsh shadows",
+        "ref_resolution": 1024,
+        "face_detail": false,
+        "face_detail_type": "face",
+        "face_detail_sampler": "euler",
+        "face_detail_scheduler": "simple",
+        "face_detail_denoise": 0.3,
+        "seed_mode": "random",
+        "state_json": "{\"seeds\": [1423614429, 1483538921, 2145302279, 1211437390, 1207820841], \"confirmed\": [false, false, false, false, false], \"prompts\": [\"The person in image 1, close-up portrait cropped to head and shoulders only, facing straight to camera, shoulders square and level, on a plain white background. Same face, hairstyle, skin tone and outfit unchanged.\", \"The person in image 1, full body visible from head to toe, standing straight facing the camera, arms relaxed by their sides, feet shoulder-width apart, on a plain white background. Same face, hairstyle, skin tone and outfit unchanged.\", \"The person in image 1, full body visible from head to toe, body turned to show a side profile facing left, arms relaxed by their sides, on a plain white background. Same face, hairstyle, skin tone and outfit unchanged.\", \"The person in image 1, full body visible from head to toe, body turned to show a side profile facing right, arms relaxed by their sides, on a plain white background. Same face, hairstyle, skin tone and outfit unchanged.\", \"The person in image 1, full body visible from head to toe, viewed directly from behind, standing straight, arms relaxed by their sides, on a plain white background. Same hairstyle and outfit unchanged, back of the outfit clearly visible.\"], \"previews\": [null, null, null, null, null], \"editInstructions\": [null, null, null, null, null], \"status\": null, \"action\": null}",
+        "output_size": "4096x2304 (Standard - default)",
+        "character_sheet_qwen_ui": ""
+      },
+      "color": "#222",
+      "bgcolor": "#000"
+    }
+  ],
+  "links": [
+    [
+      4,
+      5,
+      0,
+      6,
+      0,
+      "*"
+    ],
+    [
+      16,
+      3,
+      0,
+      9,
+      0,
+      "IMAGE"
+    ],
+    [
+      17,
+      2,
+      0,
+      9,
+      1,
+      "IMAGE"
+    ],
+    [
+      18,
+      9,
+      0,
+      5,
+      0,
+      "IMAGE"
+    ],
+    [
+      19,
+      9,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1.1,
+      "offset": [
+        2339.8993863211554,
+        227.4485358874194
+      ]
+    },
+    "frontendVersion": "1.52.7",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4,
+  "seed_widgets": {}
+}

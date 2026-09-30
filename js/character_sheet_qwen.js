@@ -334,8 +334,8 @@ function buildCharacterSheetUI(node, stateWidget, faceWidgets) {
     applyBtn.textContent = "Apply prompt (same seed)";
     applyBtn.style.cssText =
       "padding:4px 2px;border-radius:4px;border:1px solid #3f3f46;background:#27272a;color:#e4e4e7;cursor:pointer;font-size:11px;";
-    // [2026-09-17] Andy: "even if you change it and mess it all up, you can
-    // hit default prompt and it will do that." Reverts THIS pose's prompt to
+    // [2026-09-17] A way back after a prompt has been edited into a mess.
+    // Reverts THIS pose's prompt to
     // its built-in default and regenerates with it - not just a text-field
     // undo, since the default text only genuinely lives server-side
     // (DEFAULT_PROMPTS/POSE_PROMPTS in the Python) and duplicating it here
@@ -368,7 +368,7 @@ function buildCharacterSheetUI(node, stateWidget, faceWidgets) {
       "min-height:28px;padding:4px 2px;border-radius:4px;border:1px solid #a78bfa;background:#4c1d95;" +
       "color:#ede9fe;cursor:pointer;font-size:11px;";
     // [2026-09-17] Only shown once this pose actually has an active edit
-    // (see refreshConfirmedVisual) - requested via a YouTube comment: New
+    // (see refreshConfirmedVisual). New
     // seed re-rolls an active edit rather than reverting it (by design, see
     // reroll_edit), but there was no way back to the plain un-edited pose
     // short of retyping the base prompt into Apply Prompt.
@@ -418,8 +418,8 @@ function buildCharacterSheetUI(node, stateWidget, faceWidgets) {
 
   // [2026-09-23] Lives inside the same bordered edit-all box, directly under
   // "Apply edit to all", instead of floating as its own separate box below -
-  // Andy asked for it grouped in with edit-all rather than looking like an
-  // unrelated third section.
+  // grouped in with edit-all rather than looking like an unrelated third
+  // section.
   const buildBtn = document.createElement("button");
   buildBtn.textContent = "Build final sheet now";
   buildBtn.style.cssText =
@@ -510,8 +510,7 @@ function buildCharacterSheetUI(node, stateWidget, faceWidgets) {
       // the intended behavior for an actual bare run - see seed_mode's own
       // history). Apply Prompt is a targeted single-pose edit, not a bare
       // run, so it needs its own action type to stay out of that branch -
-      // a YouTube comment caught this: editing just the portrait prompt was
-      // regenerating all 5 poses.
+      // without it, editing just the portrait prompt regenerated all 5 poses.
       state.action = { type: "apply_prompt", pose: i };
       setState(stateWidget, state);
       refreshConfirmedVisual(i, false);
@@ -552,8 +551,8 @@ function buildCharacterSheetUI(node, stateWidget, faceWidgets) {
       // re-rolls THAT edit (same instruction, new seed, same source pixels
       // it was originally applied to) instead of reverting to the un-edited
       // base pose - see reroll_edit() in the Python for the full mechanism.
-      // Andy's own words: changing an outfit to green and disliking the
-      // exact shade shouldn't mean losing the green entirely.
+      // Changing an outfit to green and disliking the exact shade shouldn't
+      // mean losing the green entirely.
       const state = getState(stateWidget);
       if (state.confirmed[i]) return;
       const hasActiveEdit = !!state.editInstructions[i];
